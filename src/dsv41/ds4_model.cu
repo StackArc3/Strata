@@ -1357,6 +1357,20 @@ struct Model::Impl {
         prof_marks.clear();
         if (!prof_chunk) ++st.prof_tokens;
     }
+    // DS4_LANE_HASH: FNV-1a of the lane / GPU rows on stderr (debug only, off when unset)
+    static uint64_t fnv(const void* p, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < n; ++i) h = (h ^ ((const uint8_t*) p)[i]) * 1099511628211ull;
+        return h;
+    }
+    inline static const bool lane_hash = std::getenv("DS4_LANE_HASH") != nullptr;
+    void lane_hash_rows(const char* tag, const float* dev, int il, int64_t p0, int T, int D, cudaStream_t s) {
+        std::vector<float> v((size_t) T * D);
+        cudaMemcpyAsync(v.data(), dev, v.size() * 4, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        for (int t = 0; t < T; ++t)
+            std::fprintf(stderr, "%s L%d p%lld t%d %016llx\n", tag, il, (long long) p0, t, (unsigned long long) fnv(&v[(size_t) t * D], (size_t) D * 4));
+    }
     void dump_layer(Dev& d, const float* h, int il, int64_t p0, int T) {
         std::vector<float> v((size_t) T * g.hc * g.dim);
         cudaSetDevice(d.id);
@@ -7271,6 +7285,7 @@ struct Model::Impl {
                         if (e < 0 || e >= l.n_exp) continue;
                         ++pr[e];
                         l.heat[(size_t) e] += 1.0f;
+                        if (lane_hash) std::fprintf(stderr, "route L%d seq%u t%d e%d w%08x lane%d\n", li, next, t, e, *(unsigned*) &r.w[t][i], (int) (l.slot[(size_t) e] < 0));
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -7344,6 +7359,11 @@ struct Model::Impl {
                     const double tc = now_ms();
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
                     const int D = g.dim;
+                    if (lane_hash)
+                        for (const Ent& en : ents)
+                            for (int i = 0; i < en.n; ++i)
+                                std::fprintf(stderr, "lanehash L%d seq%u e%d t%d %016llx\n", li, next, en.e, en.tok[i],
+                                             (unsigned long long) fnv(c_yd.data() + (size_t) (en.slot0 + i) * D, (size_t) D * 4));
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
                         for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
@@ -7356,6 +7376,7 @@ struct Model::Impl {
                             for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
                         }
                         rp.cpu[t] = 1;
+                        if (lane_hash) std::fprintf(stderr, "partiash L%d seq%u t%d %016llx\n", li, next, t, (unsigned long long) fnv(rp.part[t], (size_t) D * 4));
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
@@ -10001,6 +10022,7 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (lane_hash && mi == 0) lane_hash_rows("attnhash", d.ao, l.il, p0, T, D, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -10125,6 +10147,7 @@ struct Model::Impl {
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (lane_hash && mi == 0) lane_hash_rows("gpuhash", d.moe_out, l.il, p0, T, D, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
